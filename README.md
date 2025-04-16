@@ -18,3 +18,6 @@ Key Findings:
 - A visible divide in access mirrored Astana’s historical urban development.
 - Population size modestly correlated with accessibility; however, income levels did not show a clear trend.
 - The analysis also projected potential improvements from the future Light Rail Transit (LRT) system, especially in underserved zones.
+
+
+![image](https://github.com/user-attachments/assets/3ed8c5ca-43a8-44fd-a1a1-d9689b2f1050)
