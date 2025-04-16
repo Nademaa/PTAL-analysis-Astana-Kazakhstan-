@@ -1,0 +1,652 @@
+#downloading libraries-----
+library (sf)
+library (dplyr)
+library (tidyverse)
+library (tmap)
+library (stringi)
+library (readxl)
+library (leaflet)
+library (stringr)
+library (osmdata)
+library (tmaptools)
+library (osrm)
+library (sfnetworks)
+library (OpenStreetMap)
+options (java.parameters = "Xmx2G")
+library (r5r)
+library (dodgr) 
+library (ggplot2)
+library (ggspatial)
+library (ggmap)
+library (devtools)
+library (classInt)
+
+#astana_boundaries by districts
+boundaries_lvl6<-st_read ("data_raw/boundary-polygon-lvl6.gpkg")
+boundaries_lvl6 <- st_cast(boundaries_lvl6, "POLYGON")
+boundaries_lvl6$poly_id <- as.factor(1:nrow(boundaries_lvl6))
+
+#highlight districts in astana
+custom_palette <- c("#fbb4ae", "#b3cde3", "#ccebc5", "#decbe4", "#fed9a6")
+tm_shape(astana_boundaries_lvl6) +
+  tm_polygons(col = "NAME_EN", border.col = "black", palette = custom_palette) +
+  tm_layout(legend.show = FALSE)
+
+#filtering out ‘islands’
+target <- c (3, 4, 6, 8, 10)
+boundaries<- boundaries_lvl6 %>%
+  filter (poly_id %in% target)
+
+astana_singlepoly <- st_union(boundaries)
+
+#clipping river out
+astana_bbox <- st_bbox(astana_singlepoly)
+water_bodies <- opq(bbox = astana_bbox) %>%
+  add_osm_feature(key = "natural", value = "water") %>%
+  osmdata_sf()
+
+# Extract the water polygons
+water_polygons <- water_bodies$osm_polygons
+water_multi<- water_bodies$osm_multipolygons
+water_lines <- water_bodies$osm_lines
+water_polygons<- water_polygons %>%
+  select(osm_id, geometry)
+water_multi <- water_multi %>%
+  select(osm_id, geometry)
+swb7<- swb7 %>%
+  select (osm_id, geometry)
+
+# Filter by OSM Way ID 
+swb1<-filter (water_multi, osm_id == "2390345")
+river <- c ('498872887', '317730371', '39363037', '23970652', "497398742", '498872888', '498872889', '14889958', '14889957', '1097254919', '257688016', '23978425', '16459103')
+swb2 <- water_polygons %>%
+  filter (osm_id %in% river)
+ishim <- rbind (swb1, swb2)
+
+#cutting out water bodies
+astana_boundaries <- st_difference(astana_singlepoly, st_union(ishim))
+#saving
+write_sf(astana_boundaries, 'ready_datasets/astana_boundaries.shp')
+
+
+#data cleaning ---------------------------------------------------------------------------------
+
+df<- read.csv ("data_raw/bus_info.csv")
+#deleting unnecessary rows
+df <- df[df$latitude != "/", ]
+df <- df [ ,-1]
+na_rows <- df[is.na(df$longitude) | is.na(df$latitude), ]
+print(na_rows)
+df_sf <- st_as_sf(df, coords = c("longitude", "latitude"), crs = 4326)
+
+# Add a sequential number to each duplicate in the Bus_stop column
+df_sf <- df_sf %>%
+  group_by(Bus_stop) %>%
+  mutate(adjusted_bus_stop = paste(Bus_stop, seq_along(Bus_stop), sep = "_")) %>%
+  ungroup()
+df_sf <- df_sf %>%
+  select(-Bus_stop) %>%
+  # Rename adjusted_bus_stop to Bus_stop
+  rename(Bus_stop = adjusted_bus_stop) %>%
+  # Reorder columns to place Bus_stop first
+  select(Bus_stop, everything())
+
+#deleting repeated bus stops 
+bus_stop_locations <- df_sf %>%
+  select(Bus_stop, geometry)
+#Calculate pairwise distances between all bus stops
+distances <- st_distance(bus_stop_locations)
+#Create a data frame of all possible pairs of bus stops
+pairs_df <- expand.grid(
+  Bus_stop_1 = bus_stop_locations$Bus_stop,
+  Bus_stop_2 = bus_stop_locations$Bus_stop,
+  stringsAsFactors = FALSE)
+#Add the distances to the pairs data frame, and convert it to numeric for easy filtering
+pairs_df$Distance <- as.numeric(distances)
+# Filter for pairs within 5 meters and remove self-comparisons
+close_stops <- pairs_df %>%
+  filter(Distance > 0 & Distance <= 5) %>%
+  rename(
+    Bus_stop = Bus_stop_1,
+    Close_Bus_Stop = Bus_stop_2
+  ) %>%
+  select(Bus_stop, Close_Bus_Stop)
+close_stops <- close_stops %>%
+  # Create sorted pairs by arranging Bus_stop and Close_Bus_Stop in a consistent order
+  mutate(
+    pair_1 = pmin(Bus_stop, Close_Bus_Stop),  # Always choose the "smaller" value as pair_1
+    pair_2 = pmax(Bus_stop, Close_Bus_Stop)   # Choose the "larger" value as pair_2
+  ) %>%
+  # Keep only distinct rows based on the sorted pairs
+  distinct(pair_1, pair_2, .keep_all = TRUE) %>%
+  # Remove the helper columns
+  select(-pair_1, -pair_2)
+
+# Remove rows in df_sf where Bus_stop is found in df_filtered_unique
+df_sf_filtered <- df_sf %>%
+  anti_join(close_stops, by = "Bus_stop")
+
+#leaving pt points that are within Astana boundaries
+pt_inboundaries <- st_intersection(df_sf, astana_boundaries)
+pt_inboundaries <- pt_inboundaries %>%
+  rename_with(~ paste0("route_", seq(1, 27)), 2:28)
+
+# Delete columns that only have NAs in df_sf_filtered
+pt_inboundaries <- pt_inboundaries %>%
+  select(where(~ !all(is.na(.))))
+
+locations <- pt_inboundaries[, c("Bus_stop", "geometry")]
+destinations <- locations %>%
+  st_coordinates() %>%
+  as.data.frame() %>%
+  mutate(id = locations$Bus_stop) %>%
+  rename(lon = X, lat = Y)
+
+write.csv(destinations, "data_afterR/destinations.csv")
+
+#deleting unnecessary columns
+pt_inboundaries_edited<-st_drop_geometry(pt_inboundaries)
+pt_inboundaries_edited <- pt_inboundaries_edited[, -c(29:33)]
+pt_inboundaries_edited[, 2:28] <- lapply (pt_inboundaries_edited[, 2:28], as.character)
+
+#routes displayed as a single column
+routes <- pt_inboundaries_edited %>%
+  pivot_longer(
+    cols = starts_with("route_"), # Select all route columns
+    names_to = "Route_Type",      # Temporary column name for route type (not needed here)
+    values_to = "Route"           # New column name for route values
+  ) %>%
+  filter(Route != "") %>%         # Remove rows with empty routes
+  select(Bus_stop, Route)  
+
+routes <- routes %>%
+  mutate(Route = ifelse(Route == "55A", "55a", Route))
+
+write.csv(routes, "data_afterR/stops_and_routes.csv")
+
+#adding frequency column (min)
+routes_freq<- read.csv("N:/data_raw/routes_and_frequency.csv")
+routes_freq<-rename(routes_freq, Route=bus_number)
+stops_routes_freq <- routes %>%
+  left_join(routes_freq, by = "Route")
+stops_routes_freq <- stops_routes_freq[ , -4]
+
+#adding swt
+stops_routes_freq_swt <- stops_routes_freq %>%
+  mutate(frequency_min = ifelse(is.na(frequency_min), 0, frequency_min),
+         swt = 0.5 * frequency_min)
+
+#adding awt
+stops_routes_freq_swt_awt <- stops_routes_freq_swt %>%
+  mutate(awt = swt+2)
+
+write.csv (stops_routes_freq_swt_awt, "data_afterR/half_dataset.csv")
+
+
+#calculating different grid sizes --------------------------------------------------------------------
+astana_boundaries <- st_transform(astana_boundaries, crs = 32638)
+
+# gridsize = 500m
+hexgrid <- st_make_grid(astana_boundaries,
+                        cellsize = 500, # for hexagon unit: metres / distance between opposite edges (centres of) / for square: the length of the side
+                        what = 'polygons',
+                        square = FALSE) |>
+  st_as_sf()
+grid <- hexgrid[c(unlist(st_contains(astana_boundaries, hexgrid)), 
+                  unlist(st_overlaps(astana_boundaries, hexgrid))) ,]
+grid$grid_id <- seq_len(nrow(grid))
+
+
+#getting Points of Interest (POI) i.e. centroids of grids 
+grid_centroids <- st_centroid(grid)
+grid_centroids<-st_transform(grid_centroids, 4326)
+grid_centroids <- rename (grid_centroids, geometry =x)
+
+origins <- grid_centroids %>%
+  st_coordinates() %>%
+  as.data.frame() %>%
+  mutate(id = grid_centroids$grid_id) %>%
+  rename(lon = X, lat = Y)
+
+#calculating walking distance
+#downloading network (pbf from osm)
+path <- file.path("N:/data_raw/pbf")
+r5r_core<-setup_r5(data_path=path, verbose=FALSE)
+
+ttm<- travel_time_matrix (r5r_core,
+                          origins =origins,
+                          destinations =destinations,
+                          mode = "WALK",
+                          max_walk_time = 15,
+                          walk_speed = 3.6)
+
+#combining walking time to half dataset
+#view (half_dataset)
+poi_sap_route_freq_swt_awt_wt <- merge(half_dataset, ttm, by.x = "Bus_stop", by.y = "to_id", all = TRUE)
+poi_sap_route_freq_swt_awt_wt <- poi_sap_route_freq_swt_awt_wt %>%
+  # Rename the "from_id" column to "poi"
+  rename(poi = from_id, walking_time_min = travel_time_p50) %>%
+  # Select columns to rearrange "poi" as the first column and remove the "X" column
+  select(poi, everything(), -X)
+
+# Add the new column tat_min as the sum of awt and walking_time_min
+poi_sap_route_freq_swt_awt_wt_tat <- poi_sap_route_freq_swt_awt_wt %>%
+  mutate(tat_min = awt + walking_time_min)
+
+# Add the new column edf
+poi_sap_route_freq_swt_awt_wt_tat_edf <- poi_sap_route_freq_swt_awt_wt_tat %>%
+  mutate(edf = 30/tat_min)
+colnames (poi_sap_route_freq_swt_awt_wt_tat_edf)
+
+
+# Add the weight column based on the conditions
+poi_sap_route_freq_swt_awt_wt_tat_edf_weight <- poi_sap_route_freq_swt_awt_wt_tat_edf %>%
+  group_by(poi) %>%
+  mutate(
+    max_edf = max(edf), # Calculate the maximum edf for each poi
+    weight = ifelse(edf == max_edf, 1, 0.5) # Assign 1 to routes with max edf, 0.5 to others
+  ) %>%
+  ungroup()
+
+#calculating weighted edf
+poi_sap_route_freq_swt_awt_wt_tat_edf_weight <- poi_sap_route_freq_swt_awt_wt_tat_edf_weight %>%
+  mutate(edf_weighted = edf * weight)
+
+#creating new dataset just with POI and Accessability Index (AI)
+poi_ai <- poi_sap_route_freq_swt_awt_wt_tat_edf_weight %>%
+  group_by(poi) %>%
+  summarize(ai = sum(edf_weighted, na.rm = TRUE)) %>%
+  ungroup()
+
+#attaching AI to the grid
+poi_ai <- as.data.frame(poi_ai)
+poi_ai$poi <- as.integer(poi_ai$poi)
+grid_with_ai <- grid %>%
+  left_join(poi_ai, by = c("grid_id" = "poi"))
+#substituting NAs with 0
+grid_with_ai <- grid_with_ai %>%
+  mutate(ai = ifelse(is.na(ai), 0, ai))
+
+#filtering zeros out
+AI_values <- grid_with_ai[grid_with_ai$ai != 0, ]
+
+#savings 
+write_sf (AI_values, '500grid.shp')
+
+
+# gridsize = 250m
+hexgrid <- st_make_grid(astana_boundaries,
+                        cellsize = 250, # for hexagon unit: metres / distance between opposite edges (centres of) / for square: the length of the side
+                        what = 'polygons',
+                        square = FALSE) |>
+  st_as_sf()
+grid <- hexgrid[c(unlist(st_contains(astana_boundaries, hexgrid)), 
+                  unlist(st_overlaps(astana_boundaries, hexgrid))) ,]
+grid$grid_id <- seq_len(nrow(grid))
+
+
+#getting Points of Interest (POI) i.e. centroids of grids 
+grid_centroids <- st_centroid(grid)
+grid_centroids<-st_transform(grid_centroids, 4326)
+grid_centroids <- rename (grid_centroids, geometry =x)
+
+origins <- grid_centroids %>%
+  st_coordinates() %>%
+  as.data.frame() %>%
+  mutate(id = grid_centroids$grid_id) %>%
+  rename(lon = X, lat = Y)
+
+#calculating walking distance
+#downloading network (pbf from osm)
+
+ttm<- travel_time_matrix (r5r_core,
+                          origins =origins,
+                          destinations =destinations,
+                          mode = "WALK",
+                          max_walk_time = 15,
+                          walk_speed = 3.6)
+
+#combining walking time to half dataset
+#view (half_dataset)
+poi_sap_route_freq_swt_awt_wt <- merge(half_dataset, ttm, by.x = "Bus_stop", by.y = "to_id", all = TRUE)
+poi_sap_route_freq_swt_awt_wt <- poi_sap_route_freq_swt_awt_wt %>%
+  # Rename the "from_id" column to "poi"
+  rename(poi = from_id, walking_time_min = travel_time_p50) %>%
+  # Select columns to rearrange "poi" as the first column and remove the "X" column
+  select(poi, everything(), -X)
+
+# Add the new column tat_min as the sum of awt and walking_time_min
+poi_sap_route_freq_swt_awt_wt_tat <- poi_sap_route_freq_swt_awt_wt %>%
+  mutate(tat_min = awt + walking_time_min)
+
+# Add the new column edf
+poi_sap_route_freq_swt_awt_wt_tat_edf <- poi_sap_route_freq_swt_awt_wt_tat %>%
+  mutate(edf = 30/tat_min)
+colnames (poi_sap_route_freq_swt_awt_wt_tat_edf)
+
+
+# Add the weight column based on the conditions
+poi_sap_route_freq_swt_awt_wt_tat_edf_weight <- poi_sap_route_freq_swt_awt_wt_tat_edf %>%
+  group_by(poi) %>%
+  mutate(
+    max_edf = max(edf), # Calculate the maximum edf for each poi
+    weight = ifelse(edf == max_edf, 1, 0.5) # Assign 1 to routes with max edf, 0.5 to others
+  ) %>%
+  ungroup()
+
+#calculating weighted edf
+poi_sap_route_freq_swt_awt_wt_tat_edf_weight <- poi_sap_route_freq_swt_awt_wt_tat_edf_weight %>%
+  mutate(edf_weighted = edf * weight)
+
+#creating new dataset just with POI and Accessability Index (AI)
+poi_ai <- poi_sap_route_freq_swt_awt_wt_tat_edf_weight %>%
+  group_by(poi) %>%
+  summarize(ai = sum(edf_weighted, na.rm = TRUE)) %>%
+  ungroup()
+
+#attaching AI to the grid
+poi_ai <- as.data.frame(poi_ai)
+poi_ai$poi <- as.integer(poi_ai$poi)
+grid_with_ai <- grid %>%
+  left_join(poi_ai, by = c("grid_id" = "poi"))
+#substituting NAs with 0
+grid_with_ai <- grid_with_ai %>%
+  mutate(ai = ifelse(is.na(ai), 0, ai))
+
+#filtering zeros out
+AI_values <- grid_with_ai[grid_with_ai$ai != 0, ]
+
+#savings 
+write_sf (AI_values, '250grid.shp')
+
+
+# gridsize = 100m
+hexgrid <- st_make_grid(astana_boundaries,
+                        cellsize = 100, # for hexagon unit: metres / distance between opposite edges (centres of) / for square: the length of the side
+                        what = 'polygons',
+                        square = FALSE) |>
+  st_as_sf()
+grid <- hexgrid[c(unlist(st_contains(astana_boundaries, hexgrid)), 
+                  unlist(st_overlaps(astana_boundaries, hexgrid))) ,]
+grid$grid_id <- seq_len(nrow(grid))
+
+
+#getting Points of Interest (POI) i.e. centroids of grids 
+grid_centroids <- st_centroid(grid)
+grid_centroids<-st_transform(grid_centroids, 4326)
+grid_centroids <- rename (grid_centroids, geometry =x)
+
+origins <- grid_centroids %>%
+  st_coordinates() %>%
+  as.data.frame() %>%
+  mutate(id = grid_centroids$grid_id) %>%
+  rename(lon = X, lat = Y)
+
+#calculating walking distance
+
+ttm<- travel_time_matrix (r5r_core,
+                          origins =origins,
+                          destinations =destinations,
+                          mode = "WALK",
+                          max_walk_time = 15,
+                          walk_speed = 3.6)
+
+#combining walking time to half dataset
+#view (half_dataset)
+poi_sap_route_freq_swt_awt_wt <- merge(half_dataset, ttm, by.x = "Bus_stop", by.y = "to_id", all = TRUE)
+poi_sap_route_freq_swt_awt_wt <- poi_sap_route_freq_swt_awt_wt %>%
+  # Rename the "from_id" column to "poi"
+  rename(poi = from_id, walking_time_min = travel_time_p50) %>%
+  # Select columns to rearrange "poi" as the first column and remove the "X" column
+  select(poi, everything(), -X)
+
+# Add the new column tat_min as the sum of awt and walking_time_min
+poi_sap_route_freq_swt_awt_wt_tat <- poi_sap_route_freq_swt_awt_wt %>%
+  mutate(tat_min = awt + walking_time_min)
+
+# Add the new column edf
+poi_sap_route_freq_swt_awt_wt_tat_edf <- poi_sap_route_freq_swt_awt_wt_tat %>%
+  mutate(edf = 30/tat_min)
+colnames (poi_sap_route_freq_swt_awt_wt_tat_edf)
+
+
+# Add the weight column based on the conditions
+poi_sap_route_freq_swt_awt_wt_tat_edf_weight <- poi_sap_route_freq_swt_awt_wt_tat_edf %>%
+  group_by(poi) %>%
+  mutate(
+    max_edf = max(edf), # Calculate the maximum edf for each poi
+    weight = ifelse(edf == max_edf, 1, 0.5) # Assign 1 to routes with max edf, 0.5 to others
+  ) %>%
+  ungroup()
+
+#calculating weighted edf
+poi_sap_route_freq_swt_awt_wt_tat_edf_weight <- poi_sap_route_freq_swt_awt_wt_tat_edf_weight %>%
+  mutate(edf_weighted = edf * weight)
+
+#creating new dataset just with POI and Accessability Index (AI)
+poi_ai <- poi_sap_route_freq_swt_awt_wt_tat_edf_weight %>%
+  group_by(poi) %>%
+  summarize(ai = sum(edf_weighted, na.rm = TRUE)) %>%
+  ungroup()
+
+#attaching AI to the grid
+poi_ai <- as.data.frame(poi_ai)
+poi_ai$poi <- as.integer(poi_ai$poi)
+grid_with_ai <- grid %>%
+  left_join(poi_ai, by = c("grid_id" = "poi"))
+#substituting NAs with 0
+grid_with_ai <- grid_with_ai %>%
+  mutate(ai = ifelse(is.na(ai), 0, ai))
+
+#filtering zeros out
+AI_values <- grid_with_ai[grid_with_ai$ai != 0, ]
+
+#savings 
+write_sf (AI_values, '100grid.shp')
+
+
+
+#FINAL MAP: GRIDSIZE 100M - classifying values -------------------------------------------------------
+grid100 <- st_read ('100grid.shp')
+
+#creating 20 quantile bins
+grid100 <- grid100 %>%
+  mutate(ai_bin = cut(ai, breaks = quantile(ai, probs = seq(0, 1, length.out = 21), na.rm = TRUE), 
+                      include.lowest = TRUE, labels = FALSE))
+
+#defining ai_level based on bin classification
+grid100 <- grid100 %>%
+  mutate(ai_level = case_when(
+    ai_bin %in% 1:3 ~ "Level 1",
+    ai_bin %in% 4:6 ~ "Level 2",
+    ai_bin %in% 7:9 ~ "Level 3",
+    ai_bin %in% 10:11 ~ "Level 4",
+    ai_bin %in% 12:13 ~ "Level 5",
+    ai_bin %in% 14:15 ~ "Level 6",
+    ai_bin %in% 16:17 ~ "Level 7",
+    ai_bin == 18 ~ "Level 8",
+    ai_bin == 19 ~ "Level 9",
+    ai_bin == 20 ~ "Level 10",
+    TRUE ~ NA_character_
+  ))
+
+
+#ANALYSIS WITH SOCIO-ECONOMIC FACTORS ---------------------------------------------------------------
+
+#joining grid with districts boundaries
+grid_by_districts <- st_join(grid100, clean_boundaries, left = FALSE)
+
+#finding median AI by districts
+median_ai_per_district <- grid_by_districts %>%
+  group_by(NAME_EN) %>%  # Group by district name
+  summarise(median_ai = median(ai, na.rm = TRUE)) %>% # Calculate median AI level
+  arrange(desc(median_ai))
+
+
+
+ai_colors <- c("Sarıarqa district" = "#004c6d", 
+                   "Almaty District" = "#3c7690", 
+                   "Esil district" = '#6da2b3', 
+                   "Nura district" = "#a1d0d8", 
+                   "Bayqoñır district" = "#d8ffff")
+
+median_ai_per_district <- median_ai_per_district %>%
+  mutate(color = ai_colors[NAME_EN])
+
+median_ai <- st_drop_geometry(median_ai_per_district)
+
+median_ai_w_dis <- median_ai %>%
+  inner_join (clean_boundaries, by = 'NAME_EN')
+median_ai_w_dis <- st_as_sf(median_ai_w_dis)
+
+#choropleth map AI median
+tm_shape(median_ai_w_dis) +
+  tm_polygons(col = "color", 
+              border.col = "black", 
+              border.lwd = 0.5, 
+              title = "Median AI",
+              labels = rev(c("Highest", "High", "Medium", "Low", "Lowest")),
+              legend.show = TRUE) +  
+  tm_borders(lwd = 0.5, col = "black") +  
+  tm_layout(
+    title = "",
+    legend.title.size = 0.8,
+    legend.outside = FALSE,
+    legend.position = c ('right', 'bottom')
+  )+
+  tm_add_legend(
+    type = "fill",
+    labels = c("Highest", "High", "Medium", "Low", "Lowest"),
+    col = c('#004c6d','#3c7690','#6da2b3', '#a1d0d8', '#d8ffff'),
+    title = "Median AI value"
+  )
+
+
+#INCOME ANALYSIS
+astana_income <- read.csv(‘astana_income_statistics.csv’)
+average_income <- astana_income %>%
+  left_join (clean_boundaries, by = 'NAME_EN')
+
+average_income <- st_as_sf(average_income)
+
+income_colors <- c("Esil district" = "#a50f15", 
+               "Nura district" = "#de2d26", 
+               "Bayqoñır district" = '#fb6a4a', 
+               "Almaty District" = "#fcae91", 
+               "Sarıarqa district" = "#fee5d9")
+
+average_income <- average_income %>%
+  mutate(color = income_colors[NAME_EN])
+
+tm_shape(average_income) +
+  tm_polygons(col = "color", 
+              border.col = "black", 
+              border.lwd = 0.5, 
+              title = "Median AI",
+              labels = rev(c("Highest", "High", "Medium", "Low", "Lowest")),
+              legend.show = TRUE) +  
+  tm_borders(lwd = 0.5, col = "black") +  
+  tm_layout(
+    title = "",
+    legend.title.size = 0.8,
+    legend.outside = FALSE,
+    legend.position = c ('right', 'bottom')
+  )+
+  tm_add_legend(
+    type = "fill",
+    labels = c("Highest", "High", "Medium", "Low", "Lowest"),
+    col = c('#a50f15','#de2d26','#fb6a4a','#fcae91', '#fee5d9'),
+    title = "Average Income"
+  )
+
+
+#population analysis 
+Pop <- read.csv (‘pop.csv’)
+
+pop_sorted <- pop %>%
+  arrange(desc(pop25)) %>%
+  select(NAME_EN, pop25)
+
+popsize_colors <- c("Almaty District" = "#993404", 
+                   "Sarıarqa district" = "#d95f0e", 
+                   "Esil district" = "#fe9929", 
+                   "Nura district" = "#fed98e", 
+                   "Bayqoñır district" = "#ffffd4")
+
+# Apply the colors based on district names
+pop <- pop %>%
+  mutate(color = popsize_colors[NAME_EN])
+pop_map <- clean_boundaries %>%
+  inner_join (pop, by = 'NAME_EN')
+
+#choropleth map – population sizes
+tm_shape(pop_map) +
+  tm_polygons(col = "color", 
+              border.col = "black", 
+              border.lwd = 0.5, 
+              title = "Population",
+              labels = rev(c("Highest", "High", "Medium", "Low", "Lowest")),
+              legend.show = TRUE) +  
+  tm_borders(lwd = 0.5, col = "black") +  
+  tm_layout(
+    title = "",
+    legend.title.size = 0.8,
+    legend.outside = FALSE,
+    legend.position = c ('right', 'bottom')
+  )+
+  tm_add_legend(
+    type = "fill",
+    labels = c("Highest", "High", "Medium", "Low", "Lowest"),
+    col = c('#993404','#d95f0e','#fe9929','#fed98e', '#ffffd4'),
+    title = "Population Size"
+  )
+
+
+#CREATING BAR CHART 
+no_geom_ai <- st_drop_geometry((median_ai_w_dis))
+no_geom_income <- st_drop_geometry((average_income))
+no_geom_pop <- st_drop_geometry((pop_map))
+
+#adding levels/ ranking 
+no_geom_ai$ai_rank <- rank(no_geom_ai$median_ai, ties.method = "first")
+no_geom_income$income_rank <- rank(no_geom_income$income_avg, ties.method = "first")
+no_geom_pop$pop_rank <- rank(no_geom_pop$pop25, ties.method = "first")
+
+# Merge AI and Income datasets and sort by AI rank
+ai_income <- no_geom_ai %>%
+  inner_join(no_geom_income, by = "NAME_EN") %>%
+  select(NAME_EN, ai_rank, income_rank) %>%
+  pivot_longer(cols = c(ai_rank, income_rank), names_to = "Metric", values_to = "Rank") %>%
+  mutate(NAME_EN = factor(NAME_EN, levels = no_geom_ai$NAME_EN[order(no_geom_ai$ai_rank)]))  # Sorting by AI rank
+
+# Merge AI and Population datasets and sort by AI rank
+ai_pop <- no_geom_ai %>%
+  inner_join(no_geom_pop, by = "NAME_EN") %>%
+  select(NAME_EN, ai_rank, pop_rank) %>%
+  pivot_longer(cols = c(ai_rank, pop_rank), names_to = "Metric", values_to = "Rank") %>%
+  mutate(NAME_EN = factor(NAME_EN, levels = no_geom_ai$NAME_EN[order(no_geom_ai$ai_rank)]))  # Sorting by AI rank
+
+# AI vs Income Bar Chart (Sorted by AI rank)
+ggplot(ai_income, aes(x = NAME_EN, y = Rank, fill = Metric)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  scale_fill_manual(values = c("ai_rank" = "#6494AA", "income_rank" = "#A63D40"), 
+                    labels = c("ai_rank" = "Median AI value", 
+                               "income_rank" = "Average Income")) +
+  labs(title = "(a) Median AI vs Average Income ranked by districts", 
+       x = "District (Sorted by median AI values)", 
+       y = "") +
+  theme_minimal()
+
+# AI vs Population Bar Chart (Sorted by AI rank)
+ggplot(ai_pop, aes(x = NAME_EN, y = Rank, fill = Metric)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  scale_fill_manual(values = c("ai_rank" = "#6494AA", "pop_rank" = "#E9B872"),
+                    labels = c("ai_rank" = "Median AI value", 
+                               "pop_rank" = "Population Size")) +
+  labs(title = "(b) Median AI vs Population size ranked by districts", 
+       x = "District (Sorted by median AI value)", 
+       y = " ") +
+  theme_minimal()
+
+
+
